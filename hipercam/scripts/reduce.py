@@ -87,6 +87,8 @@ def _dispatch_epsfphot_from_reduce(rfile, flist, log):
         "mask",
         "auto_shift_stars",
         "shift_box_size",
+        "shift_model",
+        "shift_order",
         "frame_epsf_stars",
         "epsf_stamp_size",
         "epsf_size",
@@ -132,8 +134,12 @@ def _dispatch_epsfphot_from_reduce(rfile, flist, log):
             "variable_ids",
             "lsqr_tol",
             "lsqr_iter",
+            "refine_position_ids",
+            "nl_max_nfev",
+            "nl_loss",
         ):
             add_value(key)
+        add_bool("nonlinear_scene")
         if not _truthy(section.get("fit_background", "yes")):
             eargs.append("--no-fit-background")
 

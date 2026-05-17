@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -245,6 +246,19 @@ def _source_grouper(min_separation):
     return SourceGrouper(min_separation)
 
 
+def _translation_transform(dx=0.0, dy=0.0, method="table", nstars=0):
+    return {
+        "model": "translation",
+        "order": 0,
+        "method": method,
+        "dx": float(dx),
+        "dy": float(dy),
+        "nstars": int(nstars),
+        "x_rms": np.nan,
+        "y_rms": np.nan,
+    }
+
+
 def _lookup_shift(shift_table, fname):
     if shift_table is None:
         return 0.0, 0.0
@@ -254,20 +268,188 @@ def _lookup_shift(shift_table, fname):
     return 0.0, 0.0
 
 
-def _centroid_shift(data, stars_tbl, box_size, mask=None, dx0=0.0, dy0=0.0):
-    if stars_tbl is None:
-        return dx0, dy0, 0, np.nan, np.nan
+def _initial_transform(shift_table, fname):
+    dx, dy = _lookup_shift(shift_table, fname)
+    return _translation_transform(dx, dy, method="table" if shift_table else "identity")
 
+
+def _poly_terms(x, y, order, x0=0.0, y0=0.0, scale=1.0):
+    xn = (np.asarray(x, dtype=float) - x0) / scale
+    yn = (np.asarray(y, dtype=float) - y0) / scale
+    terms = []
+    for degree in range(order + 1):
+        for ypow in range(degree + 1):
+            xpow = degree - ypow
+            terms.append((xn**xpow) * (yn**ypow))
+    return np.vstack(terms).T
+
+
+def _transform_term_count(order):
+    return (order + 1) * (order + 2) // 2
+
+
+def _apply_transform(transform, x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    model = transform.get("model", "translation")
+    if model == "translation":
+        return x + transform["dx"], y + transform["dy"]
+    if model == "similarity":
+        z = transform["scale_rot"] * (x + 1j * y) + transform["offset"]
+        return np.real(z), np.imag(z)
+
+    terms = _poly_terms(
+        x,
+        y,
+        transform.get("order", 1),
+        transform.get("x0", 0.0),
+        transform.get("y0", 0.0),
+        transform.get("scale", 1.0),
+    )
+    return terms @ transform["coeff_x"], terms @ transform["coeff_y"]
+
+
+def _transform_table(table, transform):
+    xy = QTable()
+    xy["x"], xy["y"] = _apply_transform(transform, table["x"], table["y"])
+    return xy
+
+
+def _fit_coordinate_transform(xmaster, ymaster, xframe, yframe, model, order=2):
+    xmaster = np.asarray(xmaster, dtype=float)
+    ymaster = np.asarray(ymaster, dtype=float)
+    xframe = np.asarray(xframe, dtype=float)
+    yframe = np.asarray(yframe, dtype=float)
+    ok = (
+        np.isfinite(xmaster)
+        & np.isfinite(ymaster)
+        & np.isfinite(xframe)
+        & np.isfinite(yframe)
+    )
+    xmaster = xmaster[ok]
+    ymaster = ymaster[ok]
+    xframe = xframe[ok]
+    yframe = yframe[ok]
+    if not len(xmaster):
+        raise hcam.HipercamError("no valid reference-star positions for shift fit")
+
+    if model == "translation":
+        dx = float(np.median(xframe - xmaster))
+        dy = float(np.median(yframe - ymaster))
+        transform = _translation_transform(dx, dy, method="epsf", nstars=len(xmaster))
+
+    elif model == "similarity":
+        if len(xmaster) < 2:
+            raise hcam.HipercamError("similarity shift model needs at least 2 stars")
+        zmaster = xmaster + 1j * ymaster
+        zframe = xframe + 1j * yframe
+        zm0 = np.mean(zmaster)
+        zf0 = np.mean(zframe)
+        denom = np.sum(np.abs(zmaster - zm0) ** 2)
+        if denom <= 0:
+            raise hcam.HipercamError("cannot fit similarity transform to one point")
+        scale_rot = np.sum((zframe - zf0) * np.conj(zmaster - zm0)) / denom
+        offset = zf0 - scale_rot * zm0
+        transform = {
+            "model": model,
+            "order": 1,
+            "method": "epsf",
+            "scale_rot": scale_rot,
+            "offset": offset,
+            "nstars": len(xmaster),
+        }
+
+    else:
+        if model == "affine":
+            order = 1
+        else:
+            order = int(order)
+            if order < 1:
+                raise hcam.HipercamError("polynomial shift order must be >= 1")
+        nterms = _transform_term_count(order)
+        if len(xmaster) < nterms:
+            raise hcam.HipercamError(
+                f"{model} shift model of order {order} needs at least "
+                f"{nterms} stars"
+            )
+        x0 = float(np.median(xmaster))
+        y0 = float(np.median(ymaster))
+        scale = float(
+            max(
+                np.ptp(xmaster),
+                np.ptp(ymaster),
+                1.0,
+            )
+        )
+        terms = _poly_terms(xmaster, ymaster, order, x0, y0, scale)
+        coeff_x = np.linalg.lstsq(terms, xframe, rcond=None)[0]
+        coeff_y = np.linalg.lstsq(terms, yframe, rcond=None)[0]
+        transform = {
+            "model": model,
+            "order": order,
+            "method": "epsf",
+            "coeff_x": coeff_x,
+            "coeff_y": coeff_y,
+            "x0": x0,
+            "y0": y0,
+            "scale": scale,
+            "nstars": len(xmaster),
+        }
+
+    xpred, ypred = _apply_transform(transform, xmaster, ymaster)
+    transform["x_rms"] = float(np.sqrt(np.mean((xpred - xframe) ** 2)))
+    transform["y_rms"] = float(np.sqrt(np.mean((ypred - yframe) ** 2)))
+    transform["dx"] = float(np.median(xpred - xmaster))
+    transform["dy"] = float(np.median(ypred - ymaster))
+    return transform
+
+
+def _transform_json(transform):
+    keep = {}
+    for key, value in transform.items():
+        if key in ("scale_rot", "offset"):
+            keep[key] = [float(np.real(value)), float(np.imag(value))]
+        elif key in ("coeff_x", "coeff_y"):
+            keep[key] = [float(item) for item in value]
+        elif isinstance(value, np.generic):
+            keep[key] = value.item()
+        else:
+            keep[key] = value
+    return json.dumps(keep, sort_keys=True)
+
+
+def _transform_summary(transform):
+    return (
+        transform.get("model", "translation"),
+        int(transform.get("order", 0)),
+        transform.get("method", "unknown"),
+        float(transform.get("dx", 0.0)),
+        float(transform.get("dy", 0.0)),
+        int(transform.get("nstars", 0)),
+        float(transform.get("x_rms", np.nan)),
+        float(transform.get("y_rms", np.nan)),
+        _transform_json(transform),
+    )
+
+
+def _centroid_reference_positions(data, stars_tbl, box_size, mask=None, base_transform=None):
+    if stars_tbl is None:
+        return [], [], []
+
+    if base_transform is None:
+        base_transform = _translation_transform()
+
+    xguess_all, yguess_all = _apply_transform(
+        base_transform, stars_tbl["x"], stars_tbl["y"]
+    )
+    xframe = []
+    yframe = []
+    indices = []
     half = max(2, int(box_size) // 2)
     ny, nx = data.shape
-    dxs = []
-    dys = []
-
-    for xmaster, ymaster in zip(stars_tbl["x"], stars_tbl["y"]):
-        xguess = float(xmaster) + dx0
-        yguess = float(ymaster) + dy0
-        ix = int(round(xguess))
-        iy = int(round(yguess))
+    for idx, (xguess, yguess) in enumerate(zip(xguess_all, yguess_all)):
+        ix = int(round(float(xguess)))
+        iy = int(round(float(yguess)))
         xmin = max(0, ix - half)
         xmax = min(nx, ix + half + 1)
         ymin = max(0, iy - half)
@@ -291,25 +473,28 @@ def _centroid_shift(data, stars_tbl, box_size, mask=None, dx0=0.0, dy0=0.0):
         xcen, ycen = centroid_com(cutout)
         if not np.isfinite(xcen) or not np.isfinite(ycen):
             continue
-        dxs.append((xmin + xcen) - float(xmaster))
-        dys.append((ymin + ycen) - float(ymaster))
+        xframe.append(xmin + xcen)
+        yframe.append(ymin + ycen)
+        indices.append(idx)
 
-    if not dxs:
-        return dx0, dy0, 0, np.nan, np.nan
-    dx = float(np.median(dxs))
-    dy = float(np.median(dys))
-    return dx, dy, len(dxs), float(np.std(dxs)), float(np.std(dys))
+    return indices, xframe, yframe
 
 
-def _auto_shift(data, stars_tbl, box_size, mask=None, dx0=0.0, dy0=0.0, epsf=None):
+def _measure_reference_positions(
+    data, stars_tbl, box_size, mask=None, epsf=None, base_transform=None
+):
     if stars_tbl is None:
-        return dx0, dy0, 0, np.nan, np.nan
+        return [], [], [], "none"
+
+    if base_transform is None:
+        base_transform = _translation_transform()
 
     if epsf is not None:
+        xguess, yguess = _apply_transform(base_transform, stars_tbl["x"], stars_tbl["y"])
         init_params = Table()
         init_params["id"] = np.arange(len(stars_tbl))
-        init_params["x"] = np.asarray(stars_tbl["x"], dtype=float) + dx0
-        init_params["y"] = np.asarray(stars_tbl["y"], dtype=float) + dy0
+        init_params["x"] = xguess
+        init_params["y"] = yguess
         try:
             shift_epsf = copy.deepcopy(epsf)
             shift_epsf.x_0.fixed = False
@@ -328,33 +513,71 @@ def _auto_shift(data, stars_tbl, box_size, mask=None, dx0=0.0, dy0=0.0, epsf=Non
         if result is not None and len(result):
             if "flags" in result.colnames:
                 result = result[result["flags"] == 0]
-            dxs = []
-            dys = []
-            if "id" in result.colnames:
-                for row in result:
-                    try:
-                        idx = int(row["id"])
-                    except (TypeError, ValueError):
-                        continue
-                    if 0 <= idx < len(stars_tbl):
-                        dx = float(row["x_fit"]) - float(stars_tbl["x"][idx])
-                        dy = float(row["y_fit"]) - float(stars_tbl["y"][idx])
-                        if np.isfinite(dx) and np.isfinite(dy):
-                            dxs.append(dx)
-                            dys.append(dy)
-            else:
-                for row, xmaster, ymaster in zip(result, stars_tbl["x"], stars_tbl["y"]):
-                    dx = float(row["x_fit"]) - float(xmaster)
-                    dy = float(row["y_fit"]) - float(ymaster)
-                    if np.isfinite(dx) and np.isfinite(dy):
-                        dxs.append(dx)
-                        dys.append(dy)
-            if dxs:
-                dx = float(np.median(dxs))
-                dy = float(np.median(dys))
-                return dx, dy, len(dxs), float(np.std(dxs)), float(np.std(dys))
+            indices = []
+            xframe = []
+            yframe = []
+            for row in result:
+                try:
+                    idx = int(row["id"])
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(stars_tbl):
+                    xfit = float(row["x_fit"])
+                    yfit = float(row["y_fit"])
+                    if np.isfinite(xfit) and np.isfinite(yfit):
+                        indices.append(idx)
+                        xframe.append(xfit)
+                        yframe.append(yfit)
+            if indices:
+                return indices, xframe, yframe, "epsf"
 
-    return _centroid_shift(data, stars_tbl, box_size, mask, dx0, dy0)
+    indices, xframe, yframe = _centroid_reference_positions(
+        data, stars_tbl, box_size, mask=mask, base_transform=base_transform
+    )
+    return indices, xframe, yframe, "centroid"
+
+
+def _auto_transform(
+    data,
+    stars_tbl,
+    box_size,
+    mask=None,
+    epsf=None,
+    base_transform=None,
+    model="translation",
+    order=2,
+):
+    if base_transform is None:
+        base_transform = _translation_transform()
+    if stars_tbl is None:
+        return base_transform
+
+    indices, xframe, yframe, method = _measure_reference_positions(
+        data,
+        stars_tbl,
+        box_size,
+        mask=mask,
+        epsf=epsf,
+        base_transform=base_transform,
+    )
+    if not indices:
+        transform = copy.deepcopy(base_transform)
+        transform["method"] = "initial"
+        transform["nstars"] = 0
+        return transform
+
+    xmaster = np.asarray(stars_tbl["x"], dtype=float)[indices]
+    ymaster = np.asarray(stars_tbl["y"], dtype=float)[indices]
+    transform = _fit_coordinate_transform(
+        xmaster,
+        ymaster,
+        xframe,
+        yframe,
+        model=model,
+        order=order,
+    )
+    transform["method"] = method
+    return transform
 
 
 def _restore_fixed_positions(result, init_params):
@@ -493,32 +716,55 @@ def _forced(args):
         bkgsub, global_bkg = _background_subtract(data, sigma=args.sigma, mask=mask)
         error = _make_error(data, args.read, args.gain)
 
-        dx, dy = _lookup_shift(shift_table, fname)
-        nshifts = 0
-        shift_xrms = np.nan
-        shift_yrms = np.nan
+        transform = _initial_transform(shift_table, fname)
         if args.auto_shifts:
-            dx, dy, nshifts, shift_xrms, shift_yrms = _auto_shift(
+            transform = _auto_transform(
                 bkgsub,
                 auto_shift_stars,
                 args.shift_box_size,
                 mask=mask,
-                dx0=dx,
-                dy0=dy,
                 epsf=epsf0,
+                base_transform=transform,
+                model=args.shift_model,
+                order=args.shift_order,
             )
-        shift_rows.append((fname, dx, dy, nshifts, shift_xrms, shift_yrms))
+        (
+            shift_model,
+            shift_order,
+            shift_method,
+            dx,
+            dy,
+            nshifts,
+            shift_xrms,
+            shift_yrms,
+            transform_info,
+        ) = _transform_summary(transform)
+        shift_rows.append(
+            (
+                fname,
+                shift_model,
+                shift_order,
+                shift_method,
+                dx,
+                dy,
+                nshifts,
+                shift_xrms,
+                shift_yrms,
+                transform_info,
+            )
+        )
 
         init_params = Table()
         init_params["id"] = source_table[args.id_column]
-        init_params["x"] = source_table[args.x_column] + dx
-        init_params["y"] = source_table[args.y_column] + dy
+        init_params["x"], init_params["y"] = _apply_transform(
+            transform, source_table[args.x_column], source_table[args.y_column]
+        )
 
         epsf_summary = {}
         if args.rebuild_epsf:
             if frame_epsf_stars is None:
                 raise hcam.HipercamError("--rebuild-epsf requires --frame-epsf-stars")
-            epsf_stars = _xy_table(frame_epsf_stars, dx=dx, dy=dy)
+            epsf_stars = _transform_table(frame_epsf_stars, transform)
             epsf, epsf_summary = _build_epsf_model(bkgsub, epsf_stars, args, mask)
             if args.frame_epsf_dir:
                 Path(args.frame_epsf_dir).mkdir(parents=True, exist_ok=True)
@@ -566,6 +812,9 @@ def _forced(args):
         result["global_bkg"] = global_bkg
         result["shift_dx"] = dx
         result["shift_dy"] = dy
+        result["shift_model"] = shift_model
+        result["shift_order"] = shift_order
+        result["shift_method"] = shift_method
         result["shift_nstars"] = nshifts
         result["shift_xrms"] = shift_xrms
         result["shift_yrms"] = shift_yrms
@@ -579,7 +828,18 @@ def _forced(args):
     if args.write_shifts:
         shifts = Table(
             rows=shift_rows,
-            names=("file", "dx", "dy", "nstars", "x_rms", "y_rms"),
+            names=(
+                "file",
+                "model",
+                "order",
+                "method",
+                "dx",
+                "dy",
+                "nstars",
+                "x_rms",
+                "y_rms",
+                "transform",
+            ),
         )
         shifts.write(args.write_shifts, overwrite=True)
 
@@ -604,6 +864,94 @@ def _psf_values(epsf, yy, xx, x0, y0):
     values = np.asarray(values, dtype=float)
     values[~np.isfinite(values)] = 0.0
     return values
+
+
+def _scene_positions(context, source_ids, position_offsets):
+    base_x = np.asarray(context["base_x"], dtype=float).copy()
+    base_y = np.asarray(context["base_y"], dtype=float).copy()
+    for nsource, sid in enumerate(source_ids):
+        if sid in position_offsets:
+            dx, dy = position_offsets[sid]
+            base_x[nsource] += dx
+            base_y[nsource] += dy
+    return _apply_transform(context["transform"], base_x, base_y)
+
+
+def _scene_model(context, source_ids, column_index, constant_ids, solution, position_offsets):
+    iframe = context["frame"] - 1
+    bkg_fit = (
+        solution[column_index[("background", None, iframe)]]
+        if ("background", None, iframe) in column_index
+        else 0.0
+    )
+    model = np.full(context["yy"].shape, bkg_fit, dtype=float)
+    xs, ys = _scene_positions(context, source_ids, position_offsets)
+    for sid, x0, y0 in zip(source_ids, xs, ys):
+        if sid in constant_ids:
+            col = column_index[("constant", sid, None)]
+        else:
+            col = column_index[("variable", sid, iframe)]
+        model += solution[col] * _psf_values(
+            context["epsf"], context["yy"], context["xx"], x0, y0
+        )
+    return model, xs, ys, bkg_fit
+
+
+def _refine_scene_nonlinear(
+    args,
+    solution,
+    contexts,
+    source_ids,
+    column_index,
+    constant_ids,
+):
+    from scipy.optimize import least_squares
+
+    refine_ids = _parse_id_set(args.refine_position_ids, source_ids)
+    refine_ids = [sid for sid in source_ids if sid in refine_ids]
+    if not refine_ids:
+        return solution, {}, {"cost": np.nan, "nfev": 0, "success": True}
+
+    nflux = len(solution)
+    p0 = np.concatenate([solution, np.zeros(2 * len(refine_ids), dtype=float)])
+
+    def unpack(params):
+        offsets = {}
+        start = nflux
+        for nsource, sid in enumerate(refine_ids):
+            offsets[sid] = (
+                params[start + 2 * nsource],
+                params[start + 2 * nsource + 1],
+            )
+        return params[:nflux], offsets
+
+    def residuals(params):
+        fluxes, offsets = unpack(params)
+        chunks = []
+        for context in contexts:
+            model, _, _, _ = _scene_model(
+                context,
+                source_ids,
+                column_index,
+                constant_ids,
+                fluxes,
+                offsets,
+            )
+            valid = context["valid"]
+            resid = (model[valid] - context["data"][valid]) / context["err"][valid]
+            chunks.append(resid.ravel())
+        return np.concatenate(chunks)
+
+    result = least_squares(
+        residuals,
+        p0,
+        max_nfev=args.nl_max_nfev,
+        loss=args.nl_loss,
+        x_scale="jac",
+    )
+    fluxes, offsets = unpack(result.x)
+    info = {"cost": result.cost, "nfev": result.nfev, "success": result.success}
+    return fluxes, offsets, info
 
 
 def _scene(args):
@@ -673,25 +1021,34 @@ def _scene(args):
         )
         bkgsub, global_bkg = _background_subtract(data, sigma=args.sigma, mask=mask)
         error = _make_error(data, args.read, args.gain)
-        dx, dy = _lookup_shift(shift_table, fname)
-        nshifts = 0
-        shift_xrms = np.nan
-        shift_yrms = np.nan
+        transform = _initial_transform(shift_table, fname)
         if args.auto_shifts:
-            dx, dy, nshifts, shift_xrms, shift_yrms = _auto_shift(
+            transform = _auto_transform(
                 bkgsub,
                 auto_shift_stars,
                 args.shift_box_size,
                 mask=mask,
-                dx0=dx,
-                dy0=dy,
                 epsf=epsf0,
+                base_transform=transform,
+                model=args.shift_model,
+                order=args.shift_order,
             )
+        (
+            shift_model,
+            shift_order,
+            shift_method,
+            dx,
+            dy,
+            nshifts,
+            shift_xrms,
+            shift_yrms,
+            transform_info,
+        ) = _transform_summary(transform)
 
         if args.rebuild_epsf:
             if frame_epsf_stars is None:
                 raise hcam.HipercamError("--rebuild-epsf requires --frame-epsf-stars")
-            epsf_stars = _xy_table(frame_epsf_stars, dx=dx, dy=dy)
+            epsf_stars = _transform_table(frame_epsf_stars, transform)
             epsf, _ = _build_epsf_model(bkgsub, epsf_stars, args, mask)
             if args.frame_epsf_dir:
                 Path(args.frame_epsf_dir).mkdir(parents=True, exist_ok=True)
@@ -707,10 +1064,24 @@ def _scene(args):
                 )
         else:
             epsf = copy.deepcopy(epsf0)
-        shift_rows.append((fname, dx, dy, nshifts, shift_xrms, shift_yrms))
+        shift_rows.append(
+            (
+                fname,
+                shift_model,
+                shift_order,
+                shift_method,
+                dx,
+                dy,
+                nshifts,
+                shift_xrms,
+                shift_yrms,
+                transform_info,
+            )
+        )
 
-        xs = np.asarray(source_table[args.x_column], dtype=float) + dx
-        ys = np.asarray(source_table[args.y_column], dtype=float) + dy
+        base_x = np.asarray(source_table[args.x_column], dtype=float)
+        base_y = np.asarray(source_table[args.y_column], dtype=float)
+        xs, ys = _apply_transform(transform, base_x, base_y)
         pad = int(args.scene_padding)
         xmin = max(0, int(np.floor(np.min(xs) - pad)))
         xmax = min(data.shape[1], int(np.ceil(np.max(xs) + pad)) + 1)
@@ -726,7 +1097,8 @@ def _scene(args):
         if nvalid == 0:
             raise hcam.HipercamError(f"no valid scene pixels in {fname}")
 
-        rhs_chunks.append((bkgsub[ymin:ymax, xmin:xmax][valid] / err[valid]).ravel())
+        data_roi = bkgsub[ymin:ymax, xmin:xmax]
+        rhs_chunks.append((data_roi[valid] / err[valid]).ravel())
 
         for sid, x0, y0 in zip(source_ids, xs, ys):
             if sid in constant_ids:
@@ -759,15 +1131,23 @@ def _scene(args):
                 "global_bkg": global_bkg,
                 "dx": dx,
                 "dy": dy,
+                "shift_model": shift_model,
+                "shift_order": shift_order,
+                "shift_method": shift_method,
                 "nshifts": nshifts,
                 "shift_xrms": shift_xrms,
                 "shift_yrms": shift_yrms,
                 "bkgsub": bkgsub,
+                "data": data_roi,
+                "err": err,
                 "epsf": epsf,
+                "transform": transform,
                 "roi": (xmin, xmax, ymin, ymax),
                 "valid": valid,
                 "yy": yy,
                 "xx": xx,
+                "base_x": base_x,
+                "base_y": base_y,
                 "xs": xs,
                 "ys": ys,
             }
@@ -775,7 +1155,9 @@ def _scene(args):
         row0 += nvalid
 
     rhs = np.concatenate(rhs_chunks)
-    matrix = coo_matrix((values, (row_idx, col_idx)), shape=(len(rhs), len(columns))).tocsr()
+    matrix = coo_matrix(
+        (values, (row_idx, col_idx)), shape=(len(rhs), len(columns))
+    ).tocsr()
     solution = lsqr(
         matrix,
         rhs,
@@ -784,15 +1166,29 @@ def _scene(args):
         iter_lim=args.lsqr_iter,
     )[0]
 
+    position_offsets = {}
+    nonlinear_info = {"cost": np.nan, "nfev": 0, "success": False}
+    if args.nonlinear_scene:
+        solution, position_offsets, nonlinear_info = _refine_scene_nonlinear(
+            args,
+            solution,
+            contexts,
+            source_ids,
+            column_index,
+            constant_ids,
+        )
+
     rows = []
     for iframe, context in enumerate(contexts):
-        bkg_fit = (
-            solution[column_index[("background", None, iframe)]]
-            if args.fit_background
-            else 0.0
+        model, xs, ys, bkg_fit = _scene_model(
+            context,
+            source_ids,
+            column_index,
+            constant_ids,
+            solution,
+            position_offsets,
         )
-        model = np.full(context["yy"].shape, bkg_fit, dtype=float)
-        for sid, x0, y0 in zip(source_ids, context["xs"], context["ys"]):
+        for nsource, (sid, x0, y0) in enumerate(zip(source_ids, xs, ys)):
             if sid in constant_ids:
                 col = column_index[("constant", sid, None)]
                 flux_type = "constant"
@@ -800,22 +1196,37 @@ def _scene(args):
                 col = column_index[("variable", sid, iframe)]
                 flux_type = "variable"
             flux = solution[col]
-            model += flux * _psf_values(context["epsf"], context["yy"], context["xx"], x0, y0)
+            pos_dx, pos_dy = position_offsets.get(sid, (0.0, 0.0))
+            master_x = context["base_x"][nsource] + pos_dx
+            master_y = context["base_y"][nsource] + pos_dy
             rows.append(
                 (
                     context["frame"],
                     context["file"],
                     context["mjdutc"],
                     sid,
+                    x0,
+                    y0,
+                    master_x,
+                    master_y,
+                    pos_dx,
+                    pos_dy,
                     flux,
                     flux_type,
                     context["dx"],
                     context["dy"],
+                    context["shift_model"],
+                    context["shift_order"],
+                    context["shift_method"],
                     context["nshifts"],
                     context["shift_xrms"],
                     context["shift_yrms"],
                     context["global_bkg"],
                     bkg_fit,
+                    bool(args.nonlinear_scene),
+                    bool(nonlinear_info["success"]),
+                    float(nonlinear_info["cost"]),
+                    int(nonlinear_info["nfev"]),
                 )
             )
         if args.residual_dir:
@@ -840,22 +1251,46 @@ def _scene(args):
             "file",
             "mjdutc",
             "id",
+            "x_fit",
+            "y_fit",
+            "master_x_fit",
+            "master_y_fit",
+            "master_dx_fit",
+            "master_dy_fit",
             "flux_fit",
             "flux_type",
             "shift_dx",
             "shift_dy",
+            "shift_model",
+            "shift_order",
+            "shift_method",
             "shift_nstars",
             "shift_xrms",
             "shift_yrms",
             "global_bkg",
             "scene_bkg_fit",
+            "nonlinear_scene",
+            "nonlinear_success",
+            "nonlinear_cost",
+            "nonlinear_nfev",
         ),
     )
     output.write(args.output, overwrite=True)
     if args.write_shifts:
         shifts = Table(
             rows=shift_rows,
-            names=("file", "dx", "dy", "nstars", "x_rms", "y_rms"),
+            names=(
+                "file",
+                "model",
+                "order",
+                "method",
+                "dx",
+                "dy",
+                "nstars",
+                "x_rms",
+                "y_rms",
+                "transform",
+            ),
         )
         shifts.write(args.write_shifts, overwrite=True)
 
@@ -896,6 +1331,18 @@ def _add_forced_frame_args(parser):
         help="table with x,y columns for stars used to measure automatic shifts",
     )
     parser.add_argument("--shift-box-size", type=int, default=15)
+    parser.add_argument(
+        "--shift-model",
+        choices=("translation", "similarity", "affine", "polynomial"),
+        default="translation",
+        help="coordinate transform fitted by --auto-shifts",
+    )
+    parser.add_argument(
+        "--shift-order",
+        type=int,
+        default=2,
+        help="polynomial order when --shift-model polynomial",
+    )
     parser.add_argument(
         "--frame-epsf-stars",
         help="table with x,y columns for stars used to rebuild each frame ePSF",
@@ -1012,6 +1459,22 @@ def _parser():
     )
     scene.add_argument("--lsqr-tol", type=float, default=1e-8)
     scene.add_argument("--lsqr-iter", type=int, default=1000)
+    scene.add_argument(
+        "--nonlinear-scene",
+        action="store_true",
+        help="jointly refine selected master-frame source positions and fluxes",
+    )
+    scene.add_argument(
+        "--refine-position-ids",
+        default="none",
+        help="comma-separated source IDs with global positions refined; use 'all' or 'none'",
+    )
+    scene.add_argument("--nl-max-nfev", type=int, default=100)
+    scene.add_argument(
+        "--nl-loss",
+        choices=("linear", "soft_l1", "huber", "cauchy", "arctan"),
+        default="linear",
+    )
     scene.set_defaults(func=_scene)
 
     return parser
