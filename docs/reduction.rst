@@ -411,7 +411,10 @@ empirical PSF rather than the analytic Gaussian or Moffat models used by
 existing HiPERCAM window, detect sources on a high-S/N master frame, and run
 forced ePSF photometry on a list of frames. This is intended as a scriptable
 crowded-field workflow for testing and validation rather than a replacement
-for the normal |reduce| path.
+for the normal |reduce| path. It accepts optional bad-pixel masks and can mask
+the known source positions only when estimating local sky backgrounds, so that
+neighbouring stars remain part of the simultaneous PSF fit rather than being
+folded into the sky level.
 
 
 Customisation

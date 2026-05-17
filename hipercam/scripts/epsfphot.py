@@ -45,9 +45,100 @@ def _window_data(hcm_file, ccd, window):
     return np.asarray(wind.data, dtype=float), wind, mccd
 
 
-def _background_subtract(data, sigma=3.0):
-    _, median, _ = sigma_clipped_stats(data, sigma=sigma)
+def _read_mask(path, ccd, window, shape):
+    if path is None:
+        return None
+
+    mask_path = Path(path)
+    try:
+        data, _, _ = _window_data(mask_path, ccd, window)
+    except Exception as hcam_error:
+        try:
+            data = np.asarray(fits.getdata(mask_path))
+        except Exception as fits_error:
+            raise hcam.HipercamError(
+                f"could not read mask '{path}' as HiPERCAM or FITS image"
+            ) from fits_error
+        if data.shape != shape:
+            raise hcam.HipercamError(
+                f"mask '{path}' has shape {data.shape}, expected {shape}; "
+                f"HiPERCAM read error was: {hcam_error}"
+            )
+    if data.shape != shape:
+        raise hcam.HipercamError(
+            f"mask '{path}' has shape {data.shape}, expected {shape}"
+        )
+    return np.asarray(data != 0, dtype=bool)
+
+
+def _data_mask(data, user_mask=None):
+    mask = ~np.isfinite(data)
+    if user_mask is not None:
+        mask |= user_mask
+    return mask if np.any(mask) else None
+
+
+def _background_subtract(data, sigma=3.0, mask=None):
+    _, median, _ = sigma_clipped_stats(data, sigma=sigma, mask=mask)
     return data - median, median
+
+
+def _source_mask(shape, x, y, radius):
+    mask = np.zeros(shape, dtype=bool)
+    if radius is None or radius <= 0:
+        return mask
+
+    ny, nx = shape
+    radius2 = radius * radius
+    for xpos, ypos in zip(np.asarray(x, dtype=float), np.asarray(y, dtype=float)):
+        if not np.isfinite(xpos) or not np.isfinite(ypos):
+            continue
+        xmin = max(0, int(np.floor(xpos - radius)))
+        xmax = min(nx, int(np.ceil(xpos + radius)) + 1)
+        ymin = max(0, int(np.floor(ypos - radius)))
+        ymax = min(ny, int(np.ceil(ypos + radius)) + 1)
+        if xmin >= xmax or ymin >= ymax:
+            continue
+        yy, xx = np.ogrid[ymin:ymax, xmin:xmax]
+        mask[ymin:ymax, xmin:xmax] |= (xx - xpos) ** 2 + (yy - ypos) ** 2 <= radius2
+    return mask
+
+
+class SourceMaskedLocalBackground:
+    """LocalBackground wrapper that ignores known sources in sky annuli."""
+
+    def __init__(
+        self,
+        inner_radius,
+        outer_radius,
+        source_positions,
+        source_radius,
+        bkg_estimator=None,
+    ):
+        self.local_background = LocalBackground(
+            inner_radius,
+            outer_radius,
+            bkg_estimator=MMMBackground() if bkg_estimator is None else bkg_estimator,
+        )
+        self.source_positions = source_positions
+        self.source_radius = source_radius
+        self._shape = None
+        self._source_mask = None
+
+    def __call__(self, data, x, y, mask=None):
+        if self._source_mask is None or self._shape != data.shape:
+            self._shape = data.shape
+            self._source_mask = _source_mask(
+                data.shape,
+                self.source_positions["x"],
+                self.source_positions["y"],
+                self.source_radius,
+            )
+        if mask is None:
+            combined_mask = self._source_mask
+        else:
+            combined_mask = np.asarray(mask, dtype=bool) | self._source_mask
+        return self.local_background(data, x, y, mask=combined_mask)
 
 
 def _write_epsf(path, epsf):
@@ -82,9 +173,17 @@ def _make_error(data, read, gain):
     return np.sqrt(read**2 + np.maximum(data, 0.0) / gain)
 
 
-def _local_background(args):
+def _local_background(args, source_positions=None):
     if args.local_bkg_inner is None or args.local_bkg_outer is None:
         return None
+    bkg_mask_radius = getattr(args, "bkg_mask_radius", None)
+    if bkg_mask_radius is not None and source_positions is not None:
+        return SourceMaskedLocalBackground(
+            args.local_bkg_inner,
+            args.local_bkg_outer,
+            source_positions,
+            bkg_mask_radius,
+        )
     return LocalBackground(
         args.local_bkg_inner,
         args.local_bkg_outer,
@@ -100,14 +199,15 @@ def _source_grouper(min_separation):
 
 def _build_epsf(args):
     data, _, _ = _window_data(args.hcm, args.ccd, args.window)
-    bkgsub, _ = _background_subtract(data, sigma=args.sigma)
+    mask = _data_mask(data, _read_mask(args.mask, args.ccd, args.window, data.shape))
+    bkgsub, _ = _background_subtract(data, sigma=args.sigma, mask=mask)
 
     stars_tbl = _read_table(args.stars)
     if "x" not in stars_tbl.colnames or "y" not in stars_tbl.colnames:
         raise hcam.HipercamError("star table must contain 'x' and 'y' columns")
 
     stars = extract_stars(
-        NDData(bkgsub),
+        NDData(bkgsub, mask=mask),
         QTable(stars_tbl[["x", "y"]]),
         size=args.stamp_size,
     )
@@ -137,7 +237,8 @@ def _build_epsf(args):
 
 def _make_source_list(args):
     data, _, _ = _window_data(args.hcm, args.ccd, args.window)
-    bkgsub, _ = _background_subtract(data, sigma=args.sigma)
+    mask = _data_mask(data, _read_mask(args.mask, args.ccd, args.window, data.shape))
+    bkgsub, _ = _background_subtract(data, sigma=args.sigma, mask=mask)
     epsf = _read_epsf(args.epsf)
     error = _make_error(data, args.read, args.gain)
 
@@ -155,6 +256,7 @@ def _make_source_list(args):
     )
     result = photometry(
         bkgsub,
+        mask=mask,
         error=error,
     )
     result = result[result["flags"] == 0]
@@ -189,7 +291,10 @@ def _forced(args):
     rows = []
     for nframe, fname in enumerate(files, start=1):
         data, _, mccd = _window_data(fname, args.ccd, args.window)
-        bkgsub, global_bkg = _background_subtract(data, sigma=args.sigma)
+        mask = _data_mask(
+            data, _read_mask(args.mask, args.ccd, args.window, data.shape)
+        )
+        bkgsub, global_bkg = _background_subtract(data, sigma=args.sigma, mask=mask)
         error = _make_error(data, args.read, args.gain)
 
         dx = dy = 0.0
@@ -215,10 +320,10 @@ def _forced(args):
             finder=None,
             grouper=_source_grouper(args.group_separation),
             aperture_radius=args.aperture_radius,
-            local_bkg_estimator=_local_background(args),
+            local_bkg_estimator=_local_background(args, init_params),
             progress_bar=False,
         )
-        result = photometry(bkgsub, error=error, init_params=init_params)
+        result = photometry(bkgsub, mask=mask, error=error, init_params=init_params)
         result["frame"] = nframe
         result["file"] = fname
         result["mjdutc"] = mccd.head.get("MJDUTC", np.nan)
@@ -234,6 +339,10 @@ def _add_common_image_args(parser):
     parser.add_argument("hcm", help="input .hcm image")
     parser.add_argument("ccd", help="CCD label")
     parser.add_argument("window", help="window label")
+    parser.add_argument(
+        "--mask",
+        help="optional HiPERCAM or FITS mask; non-zero pixels are ignored",
+    )
 
 
 def _add_photometry_args(parser):
@@ -291,12 +400,24 @@ def _parser():
     forced.add_argument("sources", help="source table from make-source-list")
     forced.add_argument("output", help="output forced-photometry table")
     forced.add_argument("--shifts", help="optional table with file,dx,dy columns")
+    forced.add_argument(
+        "--mask",
+        help="optional HiPERCAM or FITS mask; non-zero pixels are ignored",
+    )
     forced.add_argument("--id-column", default="id")
     forced.add_argument("--x-column", default="x_fit")
     forced.add_argument("--y-column", default="y_fit")
     forced.add_argument("--fixed-positions", action="store_true", default=True)
     forced.add_argument("--free-positions", dest="fixed_positions", action="store_false")
     _add_photometry_args(forced)
+    forced.add_argument(
+        "--bkg-mask-radius",
+        type=float,
+        help=(
+            "mask known source footprints by this radius only when estimating "
+            "local sky backgrounds"
+        ),
+    )
     forced.set_defaults(func=_forced)
 
     return parser
