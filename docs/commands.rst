@@ -13,6 +13,7 @@
 .. |ol-combine|  replace:: combine a list of frames
 .. |ol-csub|     replace:: subtract a constant from a frame
 .. |ol-div|      replace:: divide one frame by another
+.. |ol-epsfphot| replace:: experimental ePSF photometry helpers
 .. |ol-exploss|  replace:: plot reduce log readout noise loss factor
 .. |ol-fits2hcm| replace:: convert foreign FITs files to hcm format
 .. |ol-flagcloud| replace:: flag cloudy and junk data in a reduce log
@@ -41,6 +42,7 @@
 .. |ol-nrtplot|  replace:: plot frames as they come in [matplotlib]
 .. |ol-pbands|   replace:: plot |reduce| log as a lightcurve per CCD
 .. |ol-plog|     replace:: flexible plot of a |reduce| log
+.. |ol-psfaper|  replace:: create aperture files for PSF photometry
 .. |ol-redanal|  replace:: analyse a reduction log file
 .. |ol-reduce|   replace:: carry out photometric reduction
 .. |ol-rupdate|  replace:: updates old reduce files
@@ -102,6 +104,8 @@ useful.
    +--------------+----------------+----------+----------+---------+-----------+------------+
    | |div|        | |ol-div|       |          |          |         |   Yes     |            |
    +--------------+----------------+----------+----------+---------+-----------+------------+
+   | |epsfphot|   | |ol-epsfphot|  |          | Yes      |         |           |            |
+   +--------------+----------------+----------+----------+---------+-----------+------------+
    | |exploss|    | |ol-exploss|   | Yes      |          |         |   Yes     | Yes        |
    +--------------+----------------+----------+----------+---------+-----------+------------+
    | |fits2hcm|   | |ol-fits2hcm|  |          | Yes      |         |           |            |
@@ -155,6 +159,8 @@ useful.
    | |pbands|     | |ol-pbands|    | Yes      |          |  Yes    |           |            |
    +--------------+----------------+----------+----------+---------+-----------+------------+
    | |plog|       | |ol-plog|      | Yes      |          |  Yes    |           |            |
+   +--------------+----------------+----------+----------+---------+-----------+------------+
+   | |psfaper|    | |ol-psfaper|   |          | Yes      |         |           |            |
    +--------------+----------------+----------+----------+---------+-----------+------------+
    | |redanal|    | |ol-redanal|   |          | Yes      |         |           | Yes        |
    +--------------+----------------+----------+----------+---------+-----------+------------+
@@ -457,6 +463,7 @@ extension '.hcm' to distinguish them, although they are also FITS-format files.
 .. autoapifunction:: hipercam.scripts.combine
 .. autoapifunction:: hipercam.scripts.csub
 .. autoapifunction:: hipercam.scripts.div
+.. autoapifunction:: hipercam.scripts.epsfphot
 .. autoapifunction:: hipercam.scripts.exploss
 .. autoapifunction:: hipercam.scripts.fits2hcm
 .. autoapifunction:: hipercam.scripts.flagcloud
@@ -485,6 +492,7 @@ extension '.hcm' to distinguish them, although they are also FITS-format files.
 .. autoapifunction:: hipercam.scripts.nrtplot
 .. autoapifunction:: hipercam.scripts.pbands
 .. autoapifunction:: hipercam.scripts.plog
+.. autoapifunction:: hipercam.scripts.psfaper
 .. autoapifunction:: hipercam.scripts.redanal
 .. autoapifunction:: hipercam.scripts.reduce
 .. autoapifunction:: hipercam.scripts.rtplot

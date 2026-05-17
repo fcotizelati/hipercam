@@ -40,6 +40,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["check-manifest"]
 test = ["coverage", "nose"]
+psf = ["photutils>=3.0"]
 
 [project.urls]
 Homepage = "https://github.com/HiPERCAM/hipercam"
@@ -63,6 +64,7 @@ filtid = "hipercam.scripts.filtid:filtid"
 fits2hcm = "hipercam.scripts.fits2hcm:fits2hcm"
 flagcloud = "hipercam.scripts.flagcloud:flagcloud"
 ftargets = "hipercam.scripts.ftargets:ftargets"
+epsfphot = "hipercam.scripts.epsfphot:epsfphot"
 genred = "hipercam.scripts.genred:genred"
 grab = "hipercam.scripts.grab:grab"
 harchive = "hipercam.scripts.harchive:harchive"
@@ -94,6 +96,7 @@ ncal = "hipercam.scripts.ncal:ncal"
 pbands = "hipercam.scripts.pbands:pbands"
 pfolder = "hipercam.scripts.pfolder:pfolder"
 plog = "hipercam.scripts.plog:plog"
+psfaper = "hipercam.scripts.psfaper:psfaper"
 redanal = "hipercam.scripts.redanal:redanal"
 redplt = "hipercam.scripts.redplt:redplt"
 reduce = "hipercam.scripts.reduce:reduce"
