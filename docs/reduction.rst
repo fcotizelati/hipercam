@@ -416,6 +416,16 @@ the known source positions only when estimating local sky backgrounds, so that
 neighbouring stars remain part of the simultaneous PSF fit rather than being
 folded into the sky level.
 
+For more demanding crowded fields, |epsfphot| can also measure frame shifts by
+ePSF-fitting reference stars, rebuild the ePSF on each individual frame, write
+per-frame residual images, and run a multi-frame scene model. The scene model
+keeps the master-frame source geometry shared across the sequence while allowing
+selected sources, for example the faint target, to vary frame by frame and
+holding other blended neighbours constant. A reduce file can hand off calibrated
+``source=hf`` file-list reductions to |epsfphot| through an ``[epsf_photom]``
+section, but the output remains the |epsfphot| ECSV/FITS products rather than
+the standard HiPERCAM aperture-photometry log format.
+
 
 Customisation
 =============

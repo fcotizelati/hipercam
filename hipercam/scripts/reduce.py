@@ -37,6 +37,114 @@ __all__ = [
 NaN = float("NaN")
 
 
+def _truthy(value):
+    return str(value).strip().lower() in ("yes", "true", "1", "y")
+
+
+def _dispatch_epsfphot_from_reduce(rfile, flist, log):
+    """Run epsfphot from a reduce file [epsf_photom] handoff section."""
+    section = rfile.get("epsf_photom", None)
+    if section is None or not _truthy(section.get("use_epsf", "no")):
+        return False
+
+    from hipercam.scripts.epsfphot import epsfphot
+
+    mode = section.get("mode", "forced").strip().lower()
+    if mode not in ("forced", "scene"):
+        raise hcam.HipercamError("[epsf_photom] mode must be 'forced' or 'scene'")
+
+    missing = [
+        key
+        for key in ("ccd", "window", "epsf", "sources")
+        if key not in section or str(section[key]).strip() == ""
+    ]
+    if missing:
+        raise hcam.HipercamError(
+            "[epsf_photom] is missing required setting(s): " + ", ".join(missing)
+        )
+
+    output = section.get("output", os.path.splitext(log)[0] + "_epsf.ecsv")
+    eargs = [
+        mode,
+        flist,
+        section["ccd"],
+        section["window"],
+        section["epsf"],
+        section["sources"],
+        output,
+    ]
+
+    def add_value(key, flag=None):
+        if key in section and str(section[key]).strip().lower() != "none":
+            eargs.extend([flag or f"--{key.replace('_', '-')}", str(section[key])])
+
+    def add_bool(key, flag=None):
+        if _truthy(section.get(key, "no")):
+            eargs.append(flag or f"--{key.replace('_', '-')}")
+
+    for key in (
+        "shifts",
+        "mask",
+        "auto_shift_stars",
+        "shift_box_size",
+        "frame_epsf_stars",
+        "epsf_stamp_size",
+        "epsf_size",
+        "epsf_oversampling",
+        "epsf_maxiters",
+        "epsf_recenter_box",
+        "residual_dir",
+        "residual_prefix",
+        "write_shifts",
+        "frame_epsf_dir",
+        "frame_epsf_prefix",
+        "id_column",
+        "x_column",
+        "y_column",
+        "read",
+        "gain",
+        "sigma",
+    ):
+        add_value(key)
+
+    for key in ("auto_shifts", "rebuild_epsf", "epsf_no_smoothing"):
+        add_bool(key)
+
+    if mode == "forced":
+        for key in (
+            "fit_size",
+            "fwhm",
+            "threshold",
+            "group_separation",
+            "aperture_radius",
+            "local_bkg_inner",
+            "local_bkg_outer",
+            "bkg_mask_radius",
+        ):
+            add_value(key)
+        if _truthy(section.get("free_positions", "no")):
+            eargs.append("--free-positions")
+        else:
+            eargs.append("--fixed-positions")
+    else:
+        for key in (
+            "scene_padding",
+            "variable_ids",
+            "lsqr_tol",
+            "lsqr_iter",
+        ):
+            add_value(key)
+        if not _truthy(section.get("fit_background", "yes")):
+            eargs.append("--no-fit-background")
+
+    print(
+        "reduce: [epsf_photom] use_epsf=yes, dispatching to: "
+        + " ".join(str(item) for item in eargs)
+    )
+    epsfphot(eargs)
+    return True
+
+
 ################################################
 #
 # reduce -- reduces multi-CCD imaging photometry
@@ -311,6 +419,16 @@ def reduce(args=None):
             "name of log file to store results",
             cline.Fname("reduce.log", hcam.LOG, cline.Fname.NEW),
         )
+
+        if not server_or_local and _dispatch_epsfphot_from_reduce(rfile, resource, log):
+            return
+        elif server_or_local and _truthy(
+            rfile.get("epsf_photom", {}).get("use_epsf", "no")
+        ):
+            raise hcam.HipercamError(
+                "[epsf_photom] use_epsf=yes currently requires source=hf and a "
+                "file list of calibrated .hcm frames"
+            )
 
         tkeep = cl.get_value(
             "tkeep",
