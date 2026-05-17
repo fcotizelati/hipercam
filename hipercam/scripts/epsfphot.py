@@ -1,4 +1,19 @@
-"""Experimental ePSF photometry helpers for crowded-field work."""
+"""Experimental ePSF photometry helpers for crowded-field work.
+
+This module provides a script-level workflow around the modern
+``photutils.psf`` ePSF API. It is intentionally separate from the normal
+HiPERCAM aperture-photometry path: inputs are calibrated HiPERCAM ``.hcm``
+frames, a single CCD/window selection, and table files describing master-frame
+source or PSF-star positions; outputs are ECSV tables and optional FITS
+diagnostic images.
+
+The main assumptions are deliberately conservative. Source positions are
+defined on a high-S/N master image, frame-to-frame registration is represented
+by a translation, and a bad-pixel mask suppresses unusable pixels without
+removing neighbouring stars from the simultaneous PSF fit. Per-frame ePSFs can
+be built from reference stars, but the build is guarded by a minimum usable-star
+count and falls back to the master ePSF if a frame is not good enough.
+"""
 
 import argparse
 import copy
@@ -27,10 +42,51 @@ __all__ = ["epsfphot"]
 
 
 def _read_table(path):
+    """Read an Astropy table from disk.
+
+    Parameters
+    ----------
+    path : str or path-like
+        Path to any table format understood by `astropy.table.Table.read`.
+        The command-line interface normally uses ECSV tables because they keep
+        column names and metadata explicit, but FITS or other Astropy-supported
+        formats are accepted by this helper.
+
+    Returns
+    -------
+    astropy.table.Table
+        The decoded table.
+
+    Notes
+    -----
+    This thin wrapper exists so that all table reads go through one place. It
+    makes later changes, such as adding table validation or default format
+    handling, less invasive.
+    """
     return Table.read(path)
 
 
 def _read_file_list(path):
+    """Read a HiPERCAM frame-list file.
+
+    Parameters
+    ----------
+    path : str or path-like
+        Text file containing one input frame path per line. Empty lines and
+        lines whose first non-blank character is ``#`` are ignored.
+
+    Returns
+    -------
+    list of str
+        Cleaned list of frame paths. The order is preserved and is used as the
+        frame order in forced and scene photometry outputs.
+
+    Notes
+    -----
+    The parser intentionally does not expand wildcards or shell syntax. Keeping
+    the list format literal makes reruns reproducible and matches the existing
+    HiPERCAM ``source=hf`` file-list convention.
+    """
     with open(path) as fp:
         return [
             line.strip()
@@ -40,12 +96,74 @@ def _read_file_list(path):
 
 
 def _window_data(hcm_file, ccd, window):
+    """Load one CCD/window from a HiPERCAM ``.hcm`` file.
+
+    Parameters
+    ----------
+    hcm_file : str or path-like
+        File readable by `hipercam.MCCD.read`.
+
+    ccd : str or int
+        CCD label to select. The label is converted to a string before lookup,
+        matching the storage convention inside `hipercam.MCCD`.
+
+    window : str or int
+        Window label within the selected CCD, also converted to a string.
+
+    Returns
+    -------
+    data : numpy.ndarray
+        Floating-point view/copy of the selected window data.
+
+    wind : hipercam.Window
+        The original HiPERCAM window object. This is returned so callers can
+        access geometry or metadata if needed.
+
+    mccd : hipercam.MCCD
+        The full multi-CCD object, primarily used here for frame headers such as
+        ``MJDUTC``.
+    """
     mccd = hcam.MCCD.read(str(hcm_file))
     wind = mccd[str(ccd)][str(window)]
     return np.asarray(wind.data, dtype=float), wind, mccd
 
 
 def _read_mask(path, ccd, window, shape):
+    """Read an optional bad-pixel mask for one science window.
+
+    Parameters
+    ----------
+    path : str or path-like or None
+        Mask file. If `None`, no user mask is returned. Otherwise the helper
+        first tries to read the path as a HiPERCAM file and select the same
+        ``ccd``/``window`` as the science frame. If that fails, it tries to read
+        the path as a plain FITS image.
+
+    ccd, window : str or int
+        HiPERCAM CCD/window labels used if the mask is stored as a HiPERCAM
+        image.
+
+    shape : tuple of int
+        Expected two-dimensional image shape. Shape mismatches are fatal because
+        a shifted or mismatched mask would silently corrupt the fit.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Boolean mask where ``True`` marks pixels to ignore, or `None` when no
+        mask path was supplied.
+
+    Raises
+    ------
+    hipercam.HipercamError
+        If the mask cannot be read or if its shape does not match ``shape``.
+
+    Notes
+    -----
+    This mask is for bad pixels, saturated columns, defects, or similar pixels
+    that should not enter the fit. It is not the source-footprint mask used only
+    for local sky estimation in ``SourceMaskedLocalBackground``.
+    """
     if path is None:
         return None
 
@@ -72,6 +190,23 @@ def _read_mask(path, ccd, window, shape):
 
 
 def _data_mask(data, user_mask=None):
+    """Combine non-finite-pixel masking with an optional user mask.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Science image array.
+
+    user_mask : numpy.ndarray or None, optional
+        Boolean mask supplied by `_read_mask`. ``True`` pixels are excluded.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Combined boolean mask, or `None` if no pixels are masked. Returning
+        `None` preserves the convention used by Photutils and avoids allocating
+        mask arrays unnecessarily.
+    """
     mask = ~np.isfinite(data)
     if user_mask is not None:
         mask |= user_mask
@@ -79,11 +214,63 @@ def _data_mask(data, user_mask=None):
 
 
 def _background_subtract(data, sigma=3.0, mask=None):
+    """Subtract a robust scalar background from an image.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Input image in detector coordinates.
+
+    sigma : float, optional
+        Sigma-clipping threshold passed to `astropy.stats.sigma_clipped_stats`.
+
+    mask : numpy.ndarray or None, optional
+        Boolean mask identifying pixels to ignore when estimating the scalar
+        background.
+
+    Returns
+    -------
+    bkgsub : numpy.ndarray
+        Image with the sigma-clipped median subtracted.
+
+    median : float
+        The subtracted scalar background level.
+
+    Notes
+    -----
+    This is intentionally simple. In crowded fields a scalar background is not a
+    replacement for modelling neighbouring stars; neighbours should remain in
+    the source list and be fitted by the PSF model.
+    """
     _, median, _ = sigma_clipped_stats(data, sigma=sigma, mask=mask)
     return data - median, median
 
 
 def _xy_table(table, x_column="x", y_column="y", dx=0.0, dy=0.0):
+    """Return a normalized ``x``/``y`` position table.
+
+    Parameters
+    ----------
+    table : astropy.table.Table
+        Input table containing source or PSF-star coordinates.
+
+    x_column, y_column : str, optional
+        Names of the coordinate columns to read from ``table``.
+
+    dx, dy : float, optional
+        Translation to add to the returned coordinates. This is used when a
+        master-frame PSF-star list is shifted into an individual frame.
+
+    Returns
+    -------
+    astropy.table.QTable
+        Table with exactly two coordinate columns, ``x`` and ``y``.
+
+    Raises
+    ------
+    hipercam.HipercamError
+        If either coordinate column is missing.
+    """
     for col in (x_column, y_column):
         if col not in table.colnames:
             raise hcam.HipercamError(f"table must contain '{col}' column")
@@ -94,6 +281,33 @@ def _xy_table(table, x_column="x", y_column="y", dx=0.0, dy=0.0):
 
 
 def _source_mask(shape, x, y, radius):
+    """Build a circular footprint mask around known source positions.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Output mask shape as ``(ny, nx)``.
+
+    x, y : array-like
+        Source positions in pixel coordinates.
+
+    radius : float or None
+        Mask radius in pixels. A non-positive value disables masking and returns
+        an all-False mask.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask where ``True`` marks pixels lying inside any source
+        footprint.
+
+    Notes
+    -----
+    This helper is used only to protect local background annuli from known
+    sources. It must not be confused with the bad-pixel mask, because masking
+    neighbouring stars out of the science image would prevent the simultaneous
+    PSF fit from deblending them.
+    """
     mask = np.zeros(shape, dtype=bool)
     if radius is None or radius <= 0:
         return mask
@@ -115,7 +329,33 @@ def _source_mask(shape, x, y, radius):
 
 
 class SourceMaskedLocalBackground:
-    """LocalBackground wrapper that ignores known sources in sky annuli."""
+    """Local background estimator that masks known source footprints.
+
+    Parameters
+    ----------
+    inner_radius, outer_radius : float
+        Inner and outer radii of the local-background annulus, passed to
+        `photutils.background.LocalBackground`.
+
+    source_positions : astropy.table.Table or astropy.table.QTable
+        Table with ``x`` and ``y`` columns giving all source positions that
+        should be ignored while estimating local backgrounds.
+
+    source_radius : float
+        Radius of the circular mask placed around every source in
+        ``source_positions``.
+
+    bkg_estimator : callable, optional
+        Photutils-compatible background estimator. If omitted, an
+        `MMMBackground` estimator is used.
+
+    Notes
+    -----
+    The class is callable because Photutils expects local-background estimators
+    to be callables with the signature ``(data, x, y, mask=None)``. It caches the
+    source-footprint mask by image shape so repeated calls in one frame do not
+    rebuild the same mask.
+    """
 
     def __init__(
         self,
@@ -125,6 +365,22 @@ class SourceMaskedLocalBackground:
         source_radius,
         bkg_estimator=None,
     ):
+        """Initialise the wrapped Photutils local-background estimator.
+
+        Parameters
+        ----------
+        inner_radius, outer_radius : float
+            Annulus radii passed directly to `LocalBackground`.
+
+        source_positions : astropy.table.Table
+            Source positions used to build the cached footprint mask.
+
+        source_radius : float
+            Radius used by `_source_mask` around every known source.
+
+        bkg_estimator : callable, optional
+            Background estimator. If absent, `MMMBackground` is used.
+        """
         self.local_background = LocalBackground(
             inner_radius,
             outer_radius,
@@ -136,6 +392,25 @@ class SourceMaskedLocalBackground:
         self._source_mask = None
 
     def __call__(self, data, x, y, mask=None):
+        """Estimate local background while masking known sources.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Image passed by Photutils.
+
+        x, y : float or array-like
+            Positions at which Photutils wants the local background estimated.
+
+        mask : numpy.ndarray or None, optional
+            Existing Photutils mask. It is combined with the cached source mask.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            Local background estimate from the wrapped `LocalBackground`
+            instance.
+        """
         if self._source_mask is None or self._shape != data.shape:
             self._shape = data.shape
             self._source_mask = _source_mask(
@@ -152,6 +427,24 @@ class SourceMaskedLocalBackground:
 
 
 def _write_epsf(path, epsf):
+    """Write an `ImagePSF` model to a compact FITS file.
+
+    Parameters
+    ----------
+    path : str or path-like
+        Output FITS filename. Existing files are overwritten.
+
+    epsf : photutils.psf.ImagePSF
+        Empirical PSF model. The image data are written as the primary HDU and
+        the oversampling/origin metadata needed by `_read_epsf` are stored in
+        header keywords.
+
+    Notes
+    -----
+    The FITS file is intentionally minimal and local to this script. It is not
+    meant to be a general PSF interchange standard; it stores just enough
+    information to recreate the Photutils `ImagePSF` object.
+    """
     hdr = fits.Header()
     hdr["HIPREPSF"] = True
     hdr["OVERSX"] = int(epsf.oversampling[0])
@@ -164,6 +457,19 @@ def _write_epsf(path, epsf):
 
 
 def _read_epsf(path):
+    """Read an ePSF FITS file written by `_write_epsf`.
+
+    Parameters
+    ----------
+    path : str or path-like
+        FITS file containing an ePSF image and optional ``OVERSX``, ``OVERSY``,
+        ``ORIGINX``, and ``ORIGINY`` header keywords.
+
+    Returns
+    -------
+    photutils.psf.ImagePSF
+        ImagePSF model ready for Photutils PSF photometry.
+    """
     with fits.open(path) as hdul:
         data = np.asarray(hdul[0].data, dtype=float)
         hdr = hdul[0].header
@@ -173,6 +479,26 @@ def _read_epsf(path):
 
 
 def _epsf_arg(args, name, default=None):
+    """Return an ePSF-builder option from a command namespace.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    name : str
+        Base option name, for example ``"stamp_size"``. Forced and scene modes
+        expose these builder controls with an ``epsf_`` prefix, while
+        ``build-epsf`` exposes them without the prefix.
+
+    default : object, optional
+        Value returned when neither the prefixed nor unprefixed argument exists.
+
+    Returns
+    -------
+    object
+        The selected argument value.
+    """
     value = getattr(args, f"epsf_{name}", None)
     if value is None:
         value = getattr(args, name, default)
@@ -180,6 +506,47 @@ def _epsf_arg(args, name, default=None):
 
 
 def _build_epsf_model(data, stars_tbl, args, mask=None):
+    """Construct an empirical PSF model from selected reference stars.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Background-subtracted image containing the PSF-star positions.
+
+    stars_tbl : astropy.table.Table
+        Table with ``x`` and ``y`` columns. The stars should already be vetted
+        by the user for isolation, saturation, S/N, and detector defects; this
+        function checks only the numerical outcome of the ePSF build.
+
+    args : argparse.Namespace
+        Command arguments providing ePSF builder settings. The helper accepts
+        both unprefixed names used by ``build-epsf`` and ``epsf_``-prefixed names
+        used by frame-processing commands.
+
+    mask : numpy.ndarray or None, optional
+        Boolean mask for bad pixels and non-finite pixels.
+
+    Returns
+    -------
+    epsf : photutils.psf.ImagePSF
+        Built empirical PSF model.
+
+    summary : dict
+        Diagnostic values including number of input stars, number excluded by
+        Photutils, number used, convergence state, iteration count, and final
+        centering accuracy.
+
+    Raises
+    ------
+    hipercam.HipercamError
+        If fewer than ``min_stars`` usable stars remain after ePSF building.
+
+    Notes
+    -----
+    The minimum-star guard is deliberately conservative. It cannot decide
+    whether a PSF-star list is scientifically good, but it prevents the pipeline
+    from silently rebuilding a per-frame ePSF from too little information.
+    """
     stars = extract_stars(
         NDData(data, mask=mask),
         QTable(stars_tbl[["x", "y"]]),
@@ -222,6 +589,26 @@ def _build_epsf_model(data, stars_tbl, args, mask=None):
 
 
 def _epsf_fallback_summary(error):
+    """Create diagnostic metadata for a failed per-frame ePSF rebuild.
+
+    Parameters
+    ----------
+    error : Exception
+        Exception raised while trying to build the frame-specific ePSF.
+
+    Returns
+    -------
+    dict
+        Summary dictionary with the same broad keys as `_build_epsf_model`, but
+        marked with ``epsf_status = "fallback_master"`` and zero usable stars.
+
+    Notes
+    -----
+    Forced and scene photometry use this when ``--rebuild-epsf`` was requested
+    but the frame does not meet the ePSF guardrails. The science extraction then
+    continues with the master ePSF, and the output table records the fallback so
+    the affected frames can be inspected later.
+    """
     return {
         "epsf_status": "fallback_master",
         "epsf_n_input_stars": 0,
@@ -235,6 +622,24 @@ def _epsf_fallback_summary(error):
 
 
 def _fit_shape(value):
+    """Convert a scalar fit size into a valid two-dimensional PSF fit shape.
+
+    Parameters
+    ----------
+    value : int-like
+        Requested linear size in pixels.
+
+    Returns
+    -------
+    tuple of int
+        ``(ny, nx)`` shape with an odd size in both dimensions.
+
+    Notes
+    -----
+    Photutils PSF fitting expects a finite pixel stamp around each source. Odd
+    sizes are preferable because they provide a central pixel and avoid subtle
+    half-pixel asymmetries in small fit boxes.
+    """
     value = int(value)
     if value % 2 == 0:
         value += 1
@@ -242,10 +647,56 @@ def _fit_shape(value):
 
 
 def _make_error(data, read, gain):
+    """Construct a simple per-pixel uncertainty image.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Image in detector units before scalar background subtraction.
+
+    read : float
+        Read noise in electrons, or in units consistent with ``data`` and
+        ``gain``.
+
+    gain : float
+        Gain in electrons per data unit.
+
+    Returns
+    -------
+    numpy.ndarray
+        Per-pixel 1-sigma uncertainty estimate,
+        ``sqrt(read**2 + max(data, 0) / gain)``.
+
+    Notes
+    -----
+    This is a pragmatic weighting model for the Photutils fits. It does not
+    propagate the full HiPERCAM calibration error budget, but it prevents bright
+    pixels from being weighted as if they had the same noise as sky pixels.
+    """
     return np.sqrt(read**2 + np.maximum(data, 0.0) / gain)
 
 
 def _local_background(args, source_positions=None):
+    """Build the local-background estimator requested by command options.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments. The relevant fields are
+        ``local_bkg_inner``, ``local_bkg_outer``, and optionally
+        ``bkg_mask_radius``.
+
+    source_positions : astropy.table.Table or None, optional
+        Positions of known sources. If supplied together with
+        ``bkg_mask_radius``, these sources are masked only for local background
+        estimation.
+
+    Returns
+    -------
+    callable or None
+        Photutils-compatible local-background estimator, or `None` when no
+        local annulus was requested.
+    """
     if args.local_bkg_inner is None or args.local_bkg_outer is None:
         return None
     bkg_mask_radius = getattr(args, "bkg_mask_radius", None)
@@ -264,12 +715,51 @@ def _local_background(args, source_positions=None):
 
 
 def _source_grouper(min_separation):
+    """Create a Photutils source grouper for simultaneous local fits.
+
+    Parameters
+    ----------
+    min_separation : float or None
+        Minimum separation in pixels for grouping sources into a simultaneous
+        fit. Non-positive values disable grouping.
+
+    Returns
+    -------
+    photutils.psf.SourceGrouper or None
+        Grouper object used by Photutils, or `None` if grouping is disabled.
+    """
     if min_separation is None or min_separation <= 0:
         return None
     return SourceGrouper(min_separation)
 
 
 def _translation_transform(dx=0.0, dy=0.0, method="table", nstars=0):
+    """Represent the frame registration used by this script.
+
+    Parameters
+    ----------
+    dx, dy : float, optional
+        Translation from master-frame coordinates to the current frame.
+
+    method : str, optional
+        Provenance of the shift. Current values include ``"identity"``,
+        ``"table"``, ``"epsf"``, ``"centroid"``, and ``"initial"``.
+
+    nstars : int, optional
+        Number of reference stars used to measure the shift.
+
+    Returns
+    -------
+    dict
+        Small transform dictionary consumed by `_apply_transform` and written
+        into diagnostic output columns.
+
+    Notes
+    -----
+    The transform is deliberately limited to translation. This keeps the
+    crowded-field photometry tied to the master image while avoiding unstable
+    high-order registrations from sparse reference-star lists.
+    """
     return {
         "method": method,
         "dx": float(dx),
@@ -281,6 +771,22 @@ def _translation_transform(dx=0.0, dy=0.0, method="table", nstars=0):
 
 
 def _lookup_shift(shift_table, fname):
+    """Look up a tabulated shift for one frame.
+
+    Parameters
+    ----------
+    shift_table : astropy.table.Table or None
+        Optional table with columns ``file``, ``dx``, and ``dy``.
+
+    fname : str
+        Frame filename exactly as it appears in the input file list.
+
+    Returns
+    -------
+    tuple of float
+        ``(dx, dy)`` shift. If the table is absent or the frame is not present,
+        a zero shift is returned.
+    """
     if shift_table is None:
         return 0.0, 0.0
     match = shift_table[shift_table["file"] == fname]
@@ -290,23 +796,97 @@ def _lookup_shift(shift_table, fname):
 
 
 def _initial_transform(shift_table, fname):
+    """Create the starting transform for a frame.
+
+    Parameters
+    ----------
+    shift_table : astropy.table.Table or None
+        Optional user-supplied shift table.
+
+    fname : str
+        Frame filename.
+
+    Returns
+    -------
+    dict
+        Translation transform initialized either from the shift table or from
+        the identity transform. Automatic shift measurement, if requested, uses
+        this as its initial guess.
+    """
     dx, dy = _lookup_shift(shift_table, fname)
     return _translation_transform(dx, dy, method="table" if shift_table else "identity")
 
 
 def _apply_transform(transform, x, y):
+    """Apply a translation transform to coordinates.
+
+    Parameters
+    ----------
+    transform : dict
+        Dictionary created by `_translation_transform`.
+
+    x, y : array-like
+        Master-frame coordinates.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Coordinates shifted into the current frame.
+    """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     return x + transform["dx"], y + transform["dy"]
 
 
 def _transform_table(table, transform):
+    """Apply the current frame transform to a coordinate table.
+
+    Parameters
+    ----------
+    table : astropy.table.Table
+        Table with ``x`` and ``y`` columns.
+
+    transform : dict
+        Translation transform.
+
+    Returns
+    -------
+    astropy.table.QTable
+        New table with transformed ``x`` and ``y`` coordinates. The input table
+        is not modified.
+    """
     xy = QTable()
     xy["x"], xy["y"] = _apply_transform(transform, table["x"], table["y"])
     return xy
 
 
 def _fit_translation_transform(xmaster, ymaster, xframe, yframe):
+    """Fit a robust translational registration from reference stars.
+
+    Parameters
+    ----------
+    xmaster, ymaster : array-like
+        Reference-star positions in the master coordinate system.
+
+    xframe, yframe : array-like
+        Measured positions of the same reference stars in the current frame.
+
+    Returns
+    -------
+    dict
+        Translation transform whose ``dx`` and ``dy`` are the median measured
+        offsets, with RMS residual diagnostics in ``x_rms`` and ``y_rms``.
+
+    Raises
+    ------
+    hipercam.HipercamError
+        If no finite matched reference-star measurements are available.
+
+    Notes
+    -----
+    The median offset is used rather than an unweighted mean to make the shift
+    less sensitive to one poor reference-star measurement or a cosmic-ray hit.
+    """
     xmaster = np.asarray(xmaster, dtype=float)
     ymaster = np.asarray(ymaster, dtype=float)
     xframe = np.asarray(xframe, dtype=float)
@@ -334,6 +914,19 @@ def _fit_translation_transform(xmaster, ymaster, xframe, yframe):
 
 
 def _transform_summary(transform):
+    """Return transform fields in output-table order.
+
+    Parameters
+    ----------
+    transform : dict
+        Translation transform created by this module.
+
+    Returns
+    -------
+    tuple
+        ``(method, dx, dy, nstars, x_rms, y_rms)`` for compact insertion into
+        forced, scene, or shift diagnostic tables.
+    """
     return (
         transform.get("method", "unknown"),
         float(transform.get("dx", 0.0)),
@@ -345,6 +938,40 @@ def _transform_summary(transform):
 
 
 def _centroid_reference_positions(data, stars_tbl, box_size, mask=None, base_transform=None):
+    """Measure reference-star positions with center-of-mass centroids.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Background-subtracted image.
+
+    stars_tbl : astropy.table.Table
+        Table with master-frame ``x`` and ``y`` positions.
+
+    box_size : int
+        Linear size of the search box around each predicted star position.
+
+    mask : numpy.ndarray or None, optional
+        Bad-pixel mask.
+
+    base_transform : dict or None, optional
+        Starting translation used to predict where each reference star should
+        fall in the current frame.
+
+    Returns
+    -------
+    indices : list of int
+        Indices of successfully measured reference stars.
+
+    xframe, yframe : list of float
+        Centroid positions in the current frame.
+
+    Notes
+    -----
+    This is a fallback for automatic shift measurement when ePSF fitting of the
+    reference stars fails. It is intentionally simple and therefore should be
+    judged by the returned RMS diagnostics.
+    """
     if stars_tbl is None:
         return [], [], []
 
@@ -395,6 +1022,49 @@ def _centroid_reference_positions(data, stars_tbl, box_size, mask=None, base_tra
 def _measure_reference_positions(
     data, stars_tbl, box_size, mask=None, epsf=None, base_transform=None
 ):
+    """Measure frame positions of reference stars for shift estimation.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Background-subtracted science image.
+
+    stars_tbl : astropy.table.Table or None
+        Master-frame reference-star table with ``x`` and ``y`` columns.
+
+    box_size : int
+        Fit/search-box size in pixels.
+
+    mask : numpy.ndarray or None, optional
+        Bad-pixel mask.
+
+    epsf : photutils.psf.ImagePSF or None, optional
+        ePSF model used to fit reference-star positions. If this fit fails or
+        produces no good positions, the function falls back to centroiding.
+
+    base_transform : dict or None, optional
+        Initial master-to-frame translation.
+
+    Returns
+    -------
+    indices : list of int
+        Reference-star indices measured successfully.
+
+    xframe, yframe : list of float
+        Measured current-frame positions.
+
+    method : str
+        ``"epsf"`` when ePSF fitting succeeded, ``"centroid"`` when the
+        fallback centroid path was used, or ``"none"`` if no star table was
+        supplied.
+
+    Notes
+    -----
+    Exceptions raised by the Photutils reference-star fit are intentionally
+    swallowed here. Failed shift-star fitting should not crash the entire
+    reduction; it should fall back to the simpler centroid method and leave the
+    quality assessment to the shift RMS diagnostics.
+    """
     if stars_tbl is None:
         return [], [], [], "none"
 
@@ -457,6 +1127,34 @@ def _auto_transform(
     epsf=None,
     base_transform=None,
 ):
+    """Measure the automatic master-to-frame translation for one image.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Background-subtracted image.
+
+    stars_tbl : astropy.table.Table or None
+        Reference-star table in master-frame coordinates.
+
+    box_size : int
+        Pixel size used for reference-star fitting or centroiding.
+
+    mask : numpy.ndarray or None, optional
+        Bad-pixel mask.
+
+    epsf : photutils.psf.ImagePSF or None, optional
+        ePSF used for reference-star position fitting.
+
+    base_transform : dict or None, optional
+        Starting transform from a user shift table or identity.
+
+    Returns
+    -------
+    dict
+        Translation transform. If no reference star can be measured, the input
+        transform is returned with method ``"initial"`` and zero measured stars.
+    """
     if base_transform is None:
         base_transform = _translation_transform()
     if stars_tbl is None:
@@ -484,6 +1182,25 @@ def _auto_transform(
 
 
 def _restore_fixed_positions(result, init_params):
+    """Restore forced coordinates in Photutils fixed-position output tables.
+
+    Parameters
+    ----------
+    result : astropy.table.Table
+        Photutils result table from `PSFPhotometry`.
+
+    init_params : astropy.table.Table
+        Initial source table passed to Photutils. Its ``x`` and ``y`` columns
+        are the actual forced coordinates used for the fit.
+
+    Notes
+    -----
+    Some Photutils fixed-position configurations can leave ``x_fit`` and
+    ``y_fit`` reflecting model defaults rather than the supplied forced
+    positions. The flux fit is still performed at the requested coordinates, but
+    the output table would be misleading. This helper overwrites those columns
+    with the forced coordinates for auditability.
+    """
     if (
         not len(result)
         or "x_fit" not in result.colnames
@@ -510,11 +1227,57 @@ def _restore_fixed_positions(result, init_params):
 
 
 def _output_path(directory, prefix, nframe, fname, suffix):
+    """Construct a deterministic per-frame diagnostic filename.
+
+    Parameters
+    ----------
+    directory : str or path-like
+        Destination directory.
+
+    prefix : str
+        Filename prefix, for example ``"resid_"`` or ``"frame_"``.
+
+    nframe : int
+        One-based frame number in the input file list.
+
+    fname : str
+        Input frame filename. Its stem is included in the diagnostic filename.
+
+    suffix : str
+        Filename suffix, including extension.
+
+    Returns
+    -------
+    pathlib.Path
+        Path of the form ``directory/prefixNNNNN_inputstem_suffix``.
+    """
     root = Path(fname).stem
     return Path(directory) / f"{prefix}{nframe:05d}_{root}{suffix}"
 
 
 def _write_residual(directory, prefix, nframe, fname, photometry, data, psf_shape):
+    """Write a Photutils residual image for one forced-photometry frame.
+
+    Parameters
+    ----------
+    directory, prefix, nframe, fname
+        Components used by `_output_path` to name the output FITS file.
+
+    photometry : photutils.psf.PSFPhotometry
+        Photutils object after a fit has been run.
+
+    data : numpy.ndarray
+        Image passed to the fit, normally scalar-background-subtracted data.
+
+    psf_shape : tuple of int
+        Shape passed to ``make_residual_image``.
+
+    Notes
+    -----
+    Residual images are one of the most important diagnostics for crowded-field
+    work. Structured residuals near the target usually indicate a bad PSF,
+    missing neighbour, or incorrect geometry.
+    """
     Path(directory).mkdir(parents=True, exist_ok=True)
     residual = photometry.make_residual_image(data, psf_shape=psf_shape)
     fits.PrimaryHDU(np.asarray(residual, dtype=np.float32)).writeto(
@@ -524,6 +1287,25 @@ def _write_residual(directory, prefix, nframe, fname, photometry, data, psf_shap
 
 
 def _build_epsf(args):
+    """Command implementation for ``epsfphot build-epsf``.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed arguments containing the input HiPERCAM image, CCD/window labels,
+        PSF-star table, output ePSF path, and ePSF-builder controls.
+
+    Side Effects
+    ------------
+    Writes an ePSF FITS file to ``args.output`` and either writes or prints a
+    one-row build-summary table.
+
+    Notes
+    -----
+    The input frame is treated as the image on which the PSF-star coordinates
+    are defined. In the recommended workflow this is usually the high-S/N master
+    image rather than an individual science frame.
+    """
     data, _, _ = _window_data(args.hcm, args.ccd, args.window)
     mask = _data_mask(data, _read_mask(args.mask, args.ccd, args.window, data.shape))
     bkgsub, _ = _background_subtract(data, sigma=args.sigma, mask=mask)
@@ -543,6 +1325,26 @@ def _build_epsf(args):
 
 
 def _make_source_list(args):
+    """Command implementation for ``epsfphot make-source-list``.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed arguments containing a master image, ePSF file, output source
+        table path, detection/fitting controls, and optional residual path.
+
+    Side Effects
+    ------------
+    Writes an ECSV/FITS-style source table to ``args.output``. If requested,
+    writes a residual FITS image for the master-frame source detection pass.
+
+    Notes
+    -----
+    This command uses `IterativePSFPhotometry` to detect and fit sources on the
+    master image. For a faint known target that is below the automatic detection
+    threshold, the user should add a row manually to the resulting table using
+    the target's master-frame coordinates.
+    """
     data, _, _ = _window_data(args.hcm, args.ccd, args.window)
     mask = _data_mask(data, _read_mask(args.mask, args.ccd, args.window, data.shape))
     bkgsub, _ = _background_subtract(data, sigma=args.sigma, mask=mask)
@@ -579,6 +1381,30 @@ def _make_source_list(args):
 
 
 def _forced(args):
+    """Command implementation for frame-by-frame forced ePSF photometry.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed ``epsfphot forced`` arguments. The key inputs are a file list,
+        CCD/window labels, a master ePSF, a master-frame source table, optional
+        shift information, and optional frame-ePSF/rebuild controls.
+
+    Side Effects
+    ------------
+    Writes a stacked output table to ``args.output``. Optional side effects
+    include residual FITS images, per-frame ePSF FITS files, and a measured
+    shift table.
+
+    Notes
+    -----
+    The source table coordinates are assumed to live in the master-frame
+    coordinate system. Each science frame receives a translational correction
+    from either a user shift table or ePSF/centroid measurements of reference
+    stars. Unless ``--free-positions`` is supplied, positions are fixed and the
+    fit primarily solves for source fluxes, which is usually the safer choice
+    for faint crowded targets.
+    """
     files = _read_file_list(args.flist)
     source_table = _read_table(args.sources)
     if args.id_column not in source_table.colnames:
@@ -739,6 +1565,28 @@ def _forced(args):
 
 
 def _parse_id_set(text, ids):
+    """Parse a comma-separated source-ID selection.
+
+    Parameters
+    ----------
+    text : str or None
+        Selection string. ``"all"`` selects every ID, ``"none"`` selects no ID,
+        and comma-separated values select explicit IDs.
+
+    ids : iterable
+        Valid source IDs. Values are compared as strings so integer table IDs
+        and command-line text match naturally.
+
+    Returns
+    -------
+    set of str
+        Selected source IDs.
+
+    Raises
+    ------
+    hipercam.HipercamError
+        If the selection names an ID not present in ``ids``.
+    """
     ids = [str(item) for item in ids]
     if text is None or text.lower() == "all":
         return set(ids)
@@ -754,6 +1602,25 @@ def _parse_id_set(text, ids):
 
 
 def _psf_values(epsf, yy, xx, x0, y0):
+    """Evaluate a unit-flux ePSF template on a pixel grid.
+
+    Parameters
+    ----------
+    epsf : photutils.psf.ImagePSF
+        Empirical PSF model.
+
+    yy, xx : numpy.ndarray
+        Pixel-coordinate grids as returned by `numpy.mgrid`.
+
+    x0, y0 : float
+        Source position at which to center the template.
+
+    Returns
+    -------
+    numpy.ndarray
+        Unit-flux PSF values on the supplied grid. Non-finite values are set to
+        zero so sparse scene matrices do not inherit NaNs from the PSF model.
+    """
     values = epsf.evaluate(xx, yy, 1.0, x0, y0)
     values = np.asarray(values, dtype=float)
     values[~np.isfinite(values)] = 0.0
@@ -761,6 +1628,26 @@ def _psf_values(epsf, yy, xx, x0, y0):
 
 
 def _scene_positions(context, source_ids, position_offsets):
+    """Compute current-frame source positions for the scene model.
+
+    Parameters
+    ----------
+    context : dict
+        Per-frame context assembled by `_scene`. It contains the master
+        coordinates, the frame transform, and diagnostic metadata.
+
+    source_ids : list of str
+        Source IDs in the same order as the source table.
+
+    position_offsets : dict
+        Optional nonlinear master-frame position offsets keyed by source ID.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        ``(x, y)`` current-frame positions after applying selected master-frame
+        offsets and the frame translation.
+    """
     base_x = np.asarray(context["base_x"], dtype=float).copy()
     base_y = np.asarray(context["base_y"], dtype=float).copy()
     for nsource, sid in enumerate(source_ids):
@@ -772,6 +1659,41 @@ def _scene_positions(context, source_ids, position_offsets):
 
 
 def _scene_model(context, source_ids, column_index, constant_ids, solution, position_offsets):
+    """Render the scene model for one frame.
+
+    Parameters
+    ----------
+    context : dict
+        Per-frame image, ePSF, coordinate, and ROI information.
+
+    source_ids : list of str
+        Source IDs in table order.
+
+    column_index : dict
+        Mapping from logical model parameters to columns in the linear
+        solution vector.
+
+    constant_ids : list of str
+        Source IDs whose flux is shared across all frames.
+
+    solution : numpy.ndarray
+        Current vector of flux and optional background parameters.
+
+    position_offsets : dict
+        Optional nonlinear master-frame position offsets.
+
+    Returns
+    -------
+    model : numpy.ndarray
+        Model image over the frame ROI.
+
+    xs, ys : numpy.ndarray
+        Current-frame source positions used for the model.
+
+    bkg_fit : float
+        Scalar background term fitted for this frame, or zero if background
+        fitting is disabled.
+    """
     iframe = context["frame"] - 1
     bkg_fit = (
         solution[column_index[("background", None, iframe)]]
@@ -799,6 +1721,49 @@ def _refine_scene_nonlinear(
     column_index,
     constant_ids,
 ):
+    """Optionally refine selected global source positions with least squares.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed scene arguments. The relevant controls are
+        ``refine_position_ids``, ``nl_max_nfev``, and ``nl_loss``.
+
+    solution : numpy.ndarray
+        Initial linear least-squares scene solution.
+
+    contexts : list of dict
+        Per-frame scene contexts built by `_scene`.
+
+    source_ids : list of str
+        Source IDs in table order.
+
+    column_index : dict
+        Mapping from scene parameter labels to solution-vector indices.
+
+    constant_ids : list of str
+        Sources whose flux is global across the sequence.
+
+    Returns
+    -------
+    fluxes : numpy.ndarray
+        Refined flux/background parameter vector. If no position refinement was
+        requested, this is the input ``solution``.
+
+    offsets : dict
+        Master-frame ``(dx, dy)`` offsets keyed by refined source ID.
+
+    info : dict
+        Diagnostic information from `scipy.optimize.least_squares`, including
+        success state, cost, and number of function evaluations.
+
+    Notes
+    -----
+    This is a constrained refinement stage, not a full scene-modelling engine.
+    It adjusts selected master-frame positions and the already-defined
+    flux/background parameters while keeping the ePSF choice and frame
+    translations fixed.
+    """
     from scipy.optimize import least_squares
 
     refine_ids = _parse_id_set(args.refine_position_ids, source_ids)
@@ -810,6 +1775,7 @@ def _refine_scene_nonlinear(
     p0 = np.concatenate([solution, np.zeros(2 * len(refine_ids), dtype=float)])
 
     def unpack(params):
+        """Split the nonlinear parameter vector into fluxes and offsets."""
         offsets = {}
         start = nflux
         for nsource, sid in enumerate(refine_ids):
@@ -820,6 +1786,7 @@ def _refine_scene_nonlinear(
         return params[:nflux], offsets
 
     def residuals(params):
+        """Return weighted residuals for the nonlinear scene refinement."""
         fluxes, offsets = unpack(params)
         chunks = []
         for context in contexts:
@@ -849,6 +1816,28 @@ def _refine_scene_nonlinear(
 
 
 def _scene(args):
+    """Command implementation for multi-frame scene ePSF photometry.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed ``epsfphot scene`` arguments. Required inputs are a file list,
+        CCD/window labels, an ePSF file, a source table, and an output table.
+
+    Side Effects
+    ------------
+    Writes a long-format scene-photometry table. Optional outputs include a
+    shift table, residual FITS images for each frame ROI, and per-frame ePSF
+    FITS files.
+
+    Notes
+    -----
+    The scene model builds one weighted sparse linear system across all frames.
+    Sources named by ``--variable-ids`` get independent fluxes in every frame;
+    all other sources have one shared flux across the full sequence. This is a
+    useful stabilizer for faint targets blended with neighbours that are
+    expected to be constant.
+    """
     from scipy.sparse import coo_matrix
     from scipy.sparse.linalg import lsqr
 
@@ -1187,6 +2176,19 @@ def _scene(args):
 
 
 def _add_common_image_args(parser):
+    """Add image-selection arguments shared by image-based subcommands.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Subparser to mutate.
+
+    Notes
+    -----
+    These options identify one HiPERCAM window and an optional bad-pixel mask.
+    They are used by commands that operate on a single image, such as
+    ``build-epsf`` and ``make-source-list``.
+    """
     parser.add_argument("hcm", help="input .hcm image")
     parser.add_argument("ccd", help="CCD label")
     parser.add_argument("window", help="window label")
@@ -1197,6 +2199,20 @@ def _add_common_image_args(parser):
 
 
 def _add_photometry_args(parser):
+    """Add common Photutils detection and PSF-fitting arguments.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Subparser to mutate.
+
+    Notes
+    -----
+    These controls apply mainly to source detection and forced Photutils fits:
+    fit stamp size, approximate FWHM, detector noise model, detection threshold,
+    source grouping scale, aperture radius for initial flux estimates, optional
+    local-background annuli, and progress-bar display.
+    """
     parser.add_argument("--fit-size", type=int, default=9)
     parser.add_argument("--fwhm", type=float, default=5.0)
     parser.add_argument("--read", type=float, default=3.5)
@@ -1211,6 +2227,20 @@ def _add_photometry_args(parser):
 
 
 def _add_forced_frame_args(parser):
+    """Add frame-sequence arguments shared by forced and scene modes.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Subparser to mutate.
+
+    Notes
+    -----
+    These options describe how master-frame coordinates are mapped to each
+    science frame, whether a fresh ePSF should be attempted per frame, and which
+    diagnostic products should be written. The registration model is a
+    translation only; higher-order transforms are intentionally not exposed.
+    """
     parser.add_argument("--shifts", help="optional table with file,dx,dy columns")
     parser.add_argument(
         "--auto-shifts",
@@ -1246,6 +2276,20 @@ def _add_forced_frame_args(parser):
 
 
 def _parser():
+    """Build the ``epsfphot`` command-line parser.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        Parser with the ``build-epsf``, ``make-source-list``, ``forced``, and
+        ``scene`` subcommands registered.
+
+    Notes
+    -----
+    Keeping parser construction in one function allows tests and the ``reduce``
+    handoff to call `epsfphot` with an explicit argument list, without going
+    through a shell command.
+    """
     parser = argparse.ArgumentParser(
         prog="epsfphot",
         description="Experimental HiPERCAM ePSF crowded-field photometry helpers.",
@@ -1362,6 +2406,25 @@ def _parser():
 
 
 def epsfphot(args=None):
+    """Entry point for the experimental ePSF photometry command.
+
+    Parameters
+    ----------
+    args : list of str or None, optional
+        Command-line arguments excluding the program name. If `None`, arguments
+        are read from ``sys.argv`` through `argparse`.
+
+    Side Effects
+    ------------
+    Dispatches to one of the subcommand implementations and writes the
+    requested ECSV/FITS products.
+
+    Notes
+    -----
+    This function is intentionally small so it can be reused by
+    ``hipercam.scripts.reduce`` as an internal handoff target. All scientific
+    behaviour lives in the subcommand implementation functions above.
+    """
     parsed = _parser().parse_args(args)
     parsed.func(parsed)
 
