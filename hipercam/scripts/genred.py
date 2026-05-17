@@ -393,7 +393,12 @@ warn = 1 60000 64000
             warn_levels += f"warn = {value}\n"
 
         asec = tvals["apertures"]
-        psfsec = tvals["psf_photom"]
+        psfsec = tvals.setdefault("psf_photom", {})
+        psfsec.setdefault("use_psf", "no")
+        psfsec.setdefault("psf_model", "moffat")
+        psfsec.setdefault("fit_half_width", 15.0)
+        psfsec.setdefault("group_separation", 31.0)
+        psfsec.setdefault("positions", "fixed")
         sksec = tvals["sky"]
         csec = tvals["calibration"]
         lcsec = tvals["lcplot"]
@@ -463,6 +468,7 @@ warn = 1 60000 64000
         psfsec["use_psf"] = "no"
         psfsec["psf_model"] = "moffat"
         psfsec["fit_half_width"] = 15.0
+        psfsec["group_separation"] = 31.0
         psfsec["positions"] = "fixed"
 
         # light curve
@@ -1049,19 +1055,22 @@ fit_diff = {asec["fit_diff"]:.2f} # Maximum differential shift of multiple refer
 # The next lines are specific to the PSF photometry option. 
 # In PSF photometry, the PSF model is fit to the reference stars and
 # then the shape of the PSF is held fixed and only the scaling of the PSF
-# [and optionally the position] is fit for other sources.
+# [and optionally the position] is fit for other sources.
 # The size of the box over which data is collected for fitting is set by
-# 'fit_half_width'. Finally, 'positions' determines whether the star's
-# positions should be considered variable in the PSF fitting. If this
-# is set to fixed, the positions are held at the locations found in
-# the aperture repositioning step, otherwise the positions are refined
-# during PSF fitting. This step can fail for PSF photometry of faint
-# sources, generally fixed positions yields better results.
+# 'fit_half_width'. Stars separated by less than 'group_separation' are
+# fit simultaneously, which is important for blended sources. Set it <= 0
+# to disable grouping. Finally, 'positions' determines whether the star's
+# positions should be considered variable in the PSF fitting. If this is
+# set to fixed, the positions are held at the locations found in the aperture
+# repositioning step, otherwise the positions are refined during PSF fitting.
+# This step can fail for PSF photometry of faint sources, generally fixed
+# positions yields better results.
 
 [psf_photom]
 use_psf = {psfsec["use_psf"]} # 'yes' or 'no'
 psf_model = {psfsec["psf_model"]} # 'gaussian' or 'moffat'
 fit_half_width = {psfsec["fit_half_width"]}  # size of window used to collect the data to do the fitting
+group_separation = {psfsec["group_separation"]} # sources closer than this are fit simultaneously
 positions = {psfsec["positions"]}   # 'fixed' or 'variable'
 
 # Next lines determine how the sky background level is

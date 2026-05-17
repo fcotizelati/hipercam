@@ -8,7 +8,7 @@ from astropy.modeling.utils import ellipse_extent
 from astropy.stats import SigmaClip
 from astropy.table import Table
 from photutils.background import LocalBackground, MedianBackground
-from photutils.psf import GaussianPRF, PSFPhotometry
+from photutils.psf import GaussianPRF, PSFPhotometry, SourceGrouper
 from photutils.psf.functional_models import FLOAT_EPSILON, GAUSSIAN_FWHM_TO_SIGMA
 
 import hipercam as hcam
@@ -524,7 +524,7 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
                 "flag": flag,
                 "cmax": 0,
             }
-            return results
+        return results
 
     # we need at least one reference aperture to proceed
     nref = sum(1 for ap in ccdaper.values() if ap.ref)
@@ -560,7 +560,7 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
                 "flag": flag,
                 "cmax": 0,
             }
-            return results
+        return results
 
     wnam = wnames.pop()
 
@@ -633,16 +633,12 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
     xpos = np.array(xpos)
     ypos = np.array(ypos)
 
-    positions = Table(
-        names=["id", "x_0", "y_0"],
-        data=([int(apnam) for apnam in apnams], xpos, ypos),
-    )
     # and positions of PSF stars in the sub-window
     ref_idx = [i for i, ap in enumerate(ccdaper.values()) if ap.ref]
     psf_positions = Table(
         names=["id", "group_id", "x_0", "y_0"],
         data=(
-            [int(apnams[i]) for i in ref_idx],
+            [apnams[i] for i in ref_idx],
             np.ones(len(ref_idx), dtype=int),
             xpos[ref_idx],
             ypos[ref_idx],
@@ -658,6 +654,20 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
     )
     fitshape_box_size = int(2 * int(float(rfile["psf_photom"]["fit_half_width"])) + 1)
     fit_shape = (fitshape_box_size, fitshape_box_size)
+    group_separation = float(
+        rfile["psf_photom"].get("group_separation", fitshape_box_size)
+    )
+    grouper = SourceGrouper(group_separation) if group_separation > 0 else None
+    if grouper is None:
+        positions = Table(
+            names=["id", "group_id", "x_0", "y_0"],
+            data=(apnams, np.arange(1, len(apnams) + 1), xpos, ypos),
+        )
+    else:
+        positions = Table(
+            names=["id", "x_0", "y_0"],
+            data=(apnams, xpos, ypos),
+        )
 
     # aperture radius is only used to guess initial flux
     aperture_radius = 0.5 * (
@@ -668,6 +678,7 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
         psf_model=psf_model,
         aperture_radius=aperture_radius,
         fit_shape=fit_shape,
+        grouper=grouper,
         local_bkg_estimator=bkg,
         xy_bounds=rfile["apertures"]["fit_max_shift"],
     )
@@ -686,6 +697,7 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
         psf_model=psf_model,
         aperture_radius=aperture_radius,
         fit_shape=fit_shape,
+        grouper=grouper,
         local_bkg_estimator=bkg,
         xy_bounds=rfile["apertures"]["fit_max_shift"],
     )
@@ -700,7 +712,7 @@ def extractFluxPSF(cnam, ccd, bccd, rccd, read, gain, ccdwin, rfile, store):
             # reset flag
             flag = hcam.ALL_OK
 
-            result_row = photom_results[photom_results["id"] == int(apnam)]
+            result_row = photom_results[photom_results["id"] == apnam]
             if len(result_row) == 0:
                 flag |= hcam.NO_DATA
                 raise hcam.HipercamError(
