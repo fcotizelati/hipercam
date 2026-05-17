@@ -416,11 +416,11 @@ the known source positions only when estimating local sky backgrounds, so that
 neighbouring stars remain part of the simultaneous PSF fit rather than being
 folded into the sky level.
 
-For more demanding crowded fields, |epsfphot| can also measure frame transforms
-by ePSF-fitting reference stars. The default is a simple translation, but
-similarity, affine, and polynomial transforms can be requested when enough
-reference stars are available. It can rebuild the ePSF on each individual frame,
-write per-frame residual images, and run a multi-frame scene model. The scene
+For more demanding crowded fields, |epsfphot| can also measure translational
+frame shifts by ePSF-fitting reference stars. It can rebuild the ePSF on each
+individual frame, write per-frame residual images, and run a multi-frame scene
+model. Per-frame ePSF rebuilding enforces a minimum number of usable PSF stars
+and falls back to the master ePSF if a frame does not pass this guard. The scene
 model keeps the master-frame source geometry shared across the sequence while
 allowing selected sources, for example the faint target, to vary frame by frame
 and holding other blended neighbours constant. It also has an optional nonlinear
